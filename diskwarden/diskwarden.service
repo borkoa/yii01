@@ -1,0 +1,22 @@
+[Unit]
+Description=diskwarden - mount configured disks on arrival, unmount on flag removal
+Documentation=file:/etc/diskwarden/README.md
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+# Started via /usr/bin/bash so SELinux runs it as unconfined_service_t
+# (a script labelled etc_t cannot be executed directly by systemd).
+ExecStartPre=/usr/bin/bash /etc/diskwarden/diskwarden.sh --check
+ExecStart=/usr/bin/bash /etc/diskwarden/diskwarden.sh
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# IMPORTANT: do not add PrivateTmp=, ProtectSystem=, ProtectHome=,
+# PrivateMounts= or similar sandboxing options. They give the service its own
+# mount namespace, and the disks it mounts would be invisible to the system.
+
+[Install]
+WantedBy=multi-user.target
