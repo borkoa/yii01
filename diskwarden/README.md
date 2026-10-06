@@ -1,49 +1,92 @@
 # diskwarden
 
 A systemd daemon for AlmaLinux 10 that waits for specific disks to be connected,
-mounts them, and unmounts them when the user deletes a flag file.
+mounts them, and unmounts them when the user deletes a flag file. It is meant
+for users who only see the server through a file share and cannot run
+commands.
 
 ## How it works
 
 For every disk configured in `/etc/diskwarden/diskwarden.conf`:
 
-1. **Disk connected.** The disk appears as `/dev/disk/by-uuid/<UUID>`. diskwarden
-   mounts it at `MOUNT_POINT` and creates the **mounted flag**
+1. **Disk connected.** The disk appears as `/dev/disk/by-uuid/<UUID>`. If
+   `FSCK=yes`, diskwarden checks the filesystem first. It then mounts the disk
+   at `MOUNT_POINT` and creates the **mounted flag**
    `MOUNTED_FLAG_DIR/MOUNTED_FLAG_NAME`.
-2. **User deletes the mounted flag.** diskwarden syncs and unmounts the disk, then
+2. **User deletes the mounted flag** (or an admin runs
+   `diskwarden --unmount NAME`). diskwarden syncs and unmounts the disk, then
    creates the **safe flag** `SAFE_FLAG_DIR/SAFE_FLAG_NAME`. The `%TS%` part of
    the name is the creation time, for example
-   `BACKUP1_SAFE_TO_DISCONNECT_2026-10-06_14-25-30`.
-3. **Safe flag expires.** The safe flag is deleted `SAFE_FLAG_TTL` seconds after
-   it was created (default 300 s, or 5 minutes).
+   `backup1_SAFE_TO_DISCONNECT_2026-10-06_14-25-30`.
+3. **Safe flag expires.** The safe flag is deleted `SAFE_FLAG_TTL` seconds
+   after it was created (default 300 s, or 5 minutes).
 4. **Disk disconnected.** The next time it is connected, it is mounted again.
+   To mount it again *without* reconnecting it, run `diskwarden --mount NAME`.
+
+If the disk **cannot be checked or mounted**, diskwarden creates a **warning
+flag** `WARNING_FLAG_DIR/WARNING_FLAG_NAME` that explains why, and logs a
+warning. This happens when:
+
+| Problem | Result |
+|---------|--------|
+| No recognisable filesystem (empty, encrypted or damaged disk) | not mounted |
+| Filesystem type not supported (no kernel driver or `mount.<type>` helper, or `mount` reports "unknown filesystem type") | not mounted |
+| `FSCK=yes` but no `fsck.<type>` tool installed | mounted anyway (`FSCK_UNSUPPORTED_ACTION=mount`) or not mounted (`skip`) |
+| fsck found errors it could not fix (exit code 2 or higher) | not mounted |
+| Any other mount error | not mounted |
+
+The warning flag is removed when the disk is disconnected or mounted
+successfully, or after `WARNING_FLAG_TTL` seconds if that is not 0.
 
 Other behaviour:
 
 * **Disk is busy when unmounting.** diskwarden retries `UMOUNT_RETRIES` times. If
   every attempt fails, it re-creates the mounted flag with the error and the list
   of processes using the disk written inside. Delete the flag again to retry.
-* **Disk not reconnected yet.** An unmounted disk that is still connected is not
-  mounted again until it has been disconnected and reconnected, or the service
-  is restarted.
 * **Disk unplugged while mounted.** The mount is detached lazily and the
   mounted flag is removed.
 * **Disk unmounted or mounted by hand.** diskwarden notices and updates the
   flags to match.
 * **Service stops or restarts.** Mounted disks stay mounted. On start,
-  diskwarden takes over disks that are already mounted on their mount point and
-  re-creates any missing mounted flags.
+  diskwarden takes over disks that are already mounted on their mount point.
 * **Configuration reload.** `systemctl reload diskwarden` re-reads the
   configuration. If the new file is invalid, the old configuration stays active.
+
+## Commands
+
+```
+diskwarden --status          # state of every disk and the last event
+diskwarden --mount NAME      # mount again without reconnecting the disk
+diskwarden --unmount NAME    # unmount (same as deleting the mounted flag)
+diskwarden --check           # validate and print the configuration
+```
+
+`--mount` and `--unmount` send a request to the running daemon and wait for
+the result. All commands except `--check` need root.
+
+```
+diskwarden daemon: running
+
+NAME         STATE                                  MOUNT POINT              SINCE               LAST EVENT
+backup1      mounted                                /mnt/backup1             2026-10-06 14:20:03 mounted (ext4)
+archive      unmounted, safe to disconnect          /mnt/archive             2026-10-06 14:25:30 unmounted
+usbstick     connected, NOT mounted (see warning)   /mnt/usbstick            2026-10-06 14:26:11 Filesystem type 'ntfs' is not supported ...
+```
 
 ## Files
 
 | Path | Purpose |
 |------|---------|
-| `/etc/diskwarden/diskwarden.sh`   | the daemon script |
+| `PROGRAM_DIR/diskwarden.sh` (default `/usr/libexec/diskwarden/`) | the daemon and admin command |
+| `COMMAND_LINK` (default `/usr/sbin/diskwarden`) | symlink to the program |
 | `/etc/diskwarden/diskwarden.conf` | configuration |
-| `/etc/diskwarden/README.md`       | this file |
-| `/etc/systemd/system/diskwarden.service` | systemd unit |
+| `/etc/systemd/system/diskwarden.service` | systemd unit, generated by `install.sh` |
+| `/usr/share/doc/diskwarden/README.md` | this file |
+| `CONTROL_DIR` (default `/run/diskwarden/control`) | status file and requests (root only) |
+
+`PROGRAM_DIR` and `COMMAND_LINK` are set in the `[global]` section of the
+config. `install.sh` reads them from there. After changing them, run
+`./install.sh` again: it installs to the new place and removes the old copy.
 
 ## Install
 
@@ -51,69 +94,133 @@ Other behaviour:
 sudo ./install.sh
 lsblk -o NAME,SIZE,FSTYPE,UUID,LABEL      # find your disk UUIDs
 sudo vi /etc/diskwarden/diskwarden.conf
-sudo /etc/diskwarden/diskwarden.sh --check
+sudo diskwarden --check
 sudo systemctl enable --now diskwarden
+sudo diskwarden --status
 journalctl -u diskwarden -f
 ```
 
-To uninstall, run `sudo ./install.sh --uninstall`. This keeps `/etc/diskwarden`.
+* **Upgrading.** Run `./install.sh` again. An existing config is kept, and the
+  new example is written next to it as `diskwarden.conf.new`. A running
+  service is restarted. Version 1 files in `/etc/diskwarden` are removed.
+* **Uninstalling.** Run `sudo ./install.sh --uninstall`. This keeps
+  `/etc/diskwarden`.
 
 ## Configuration
 
-The file has a `[global]` section and one `[mount NAME]` section per disk. Any
-setting other than `POLL_INTERVAL` can go in `[global]` as a default and be
-overridden in a mount section. **Directories (`*_DIR`) and file names (`*_NAME`)
-are always separate settings.**
+The file has a `[global]` section and one `[mount NAME]` section per disk.
+Every per-mount setting can go in `[global]` as a default and be overridden in
+a mount section. **Directories (`*_DIR`) and file names (`*_NAME`) are always
+separate settings.**
+
+### Global only
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `POLL_INTERVAL` (global only) | `2` | Seconds between checks. |
+| `POLL_INTERVAL` | `2` | Seconds between checks. |
+| `PROGRAM_DIR` | `/usr/libexec/diskwarden` | Install location of the program (used by `install.sh`). |
+| `COMMAND_LINK` | `/usr/sbin/diskwarden` | Symlink to the program. Leave empty for none. |
+| `CONTROL_DIR` | `/run/diskwarden/control` | Private directory for status and requests. |
+
+### Per mount
+
+| Key | Default | Description |
+|-----|---------|-------------|
 | `UUID` | – (required) | Filesystem UUID of the disk. |
 | `MOUNT_POINT` | – (required) | Absolute path to mount the disk on. |
-| `FS_TYPE` | `auto` | `mount -t` value. Set to `auto` to let `mount` detect the type. |
+| `FS_TYPE` | `auto` | `mount -t` value. Set to `auto` to detect the type. |
 | `MOUNT_OPTIONS` | `defaults` | `mount -o` value. |
 | `CREATE_MOUNT_POINT` | `yes` | Create `MOUNT_POINT` if it is missing. |
-| `MOUNTED_FLAG_DIR` | `/run/diskwarden` | Directory of the mounted flag. |
-| `MOUNTED_FLAG_NAME` | `%NAME%.MOUNTED` | File name of the mounted flag. |
-| `SAFE_FLAG_DIR` | `/run/diskwarden` | Directory of the safe flag. Must not be on the disk. |
-| `SAFE_FLAG_NAME` | `%NAME%.SAFE_TO_DISCONNECT.%TS%` | File name of the safe flag. Must contain `%TS%` exactly once. |
+| `UMOUNT_RETRIES` | `3` | Number of extra unmount attempts when the disk is busy. |
+| `FSCK` | `no` | Run fsck before mounting. |
+| `FSCK_OPTIONS` | `-p` | Options passed to fsck. `-p` repairs only what is safe automatically. |
+| `FSCK_UNSUPPORTED_ACTION` | `mount` | `mount` or `skip` when `fsck.<type>` is missing. A warning is written either way. |
+| `MOUNTED_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.MOUNTED` | Mounted flag. |
+| `SAFE_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.SAFE_TO_DISCONNECT.%TS%` | Safe flag. The name must contain `%TS%`. |
 | `SAFE_FLAG_TTL` | `300` | Lifetime of the safe flag, in seconds. |
+| `WARNING_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.WARNING` | Warning flag. `%TS%` is optional in the name. |
+| `WARNING_FLAG_TTL` | `0` | Lifetime of the warning flag, in seconds. `0` keeps it until the disk is disconnected or mounted. |
 | `TIMESTAMP_FORMAT` | `%Y-%m-%d_%H-%M-%S` | strftime format used for `%TS%`. |
 | `FLAG_OWNER` | *(root)* | `user` or `user:group` that owns the flag files. |
-| `FLAG_MODE` | `0664` | Mode of the flag files. |
+| `FLAG_MODE` | `0664` | Mode of the flag files. Execute bits are not allowed. |
 | `FLAG_DIR_MODE` | `0775` | Mode applied to flag directories that diskwarden creates. |
-| `UMOUNT_RETRIES` | `3` | Number of extra unmount attempts when the disk is busy. |
+| `ON_MOUNT`, `ON_UNMOUNT`, `ON_DISCONNECT`, `ON_WARNING`, `ON_ERROR` | *(empty)* | Hook commands, described below. |
+| `HOOK_TIMEOUT` | `60` | Seconds before a hook is killed. |
 
 `%NAME%` (the mount's name) and `%UUID%` can be used in `MOUNT_POINT`, `*_DIR`
-and `*_NAME`.
+and `*_NAME`. The defaults in the shipped config file differ slightly from
+the built-in defaults shown here; for example, it uses `/srv/diskwarden` for
+the flags.
 
-### Permissions
+### Hooks
+
+Each `ON_*` setting is a shell command run as root, in the background, so it
+never blocks the daemon. Its output goes to the journal. Details are passed
+**only as environment variables**, so a disk label or message can never inject
+shell code:
+
+| Variable | Contents |
+|----------|----------|
+| `DISKWARDEN_EVENT` | `MOUNT`, `UNMOUNT`, `DISCONNECT`, `WARNING` or `ERROR` |
+| `DISKWARDEN_NAME` | name of the mount |
+| `DISKWARDEN_UUID` | UUID of the disk |
+| `DISKWARDEN_DEVICE` | device node, for example `/dev/sdb1` |
+| `DISKWARDEN_MOUNT_POINT` | mount point |
+| `DISKWARDEN_MOUNTED_FLAG` | path of the mounted flag |
+| `DISKWARDEN_MESSAGE` | human-readable description of the event |
+
+`WARNING` covers an unsupported filesystem or a missing fsck tool. `ERROR`
+covers fsck failures, mount failures and unmount failures.
+
+```
+ON_MOUNT=/usr/local/bin/start-backup "$DISKWARDEN_MOUNT_POINT"
+ON_WARNING=echo "$DISKWARDEN_MESSAGE" | mail -s "disk $DISKWARDEN_NAME" admin@example.com
+```
+
+### Permissions and security
 
 To delete the mounted flag, a user needs **write permission on
 `MOUNTED_FLAG_DIR`**. Either point it at a directory the user can write to, or
 let diskwarden create the directory with the right `FLAG_OWNER` and
 `FLAG_DIR_MODE`. It applies these only to directories it creates.
 
+Because users can write to the flag directories, diskwarden never writes
+through an existing path:
+
+* Each flag is written to a new file with a random name, created exclusively
+  with the final mode. It is then renamed over the flag path.
+* Ownership changes use `chown -h`.
+* A flag directory that is a symbolic link is refused.
+
+A symlink that a user plants at a flag path is therefore replaced, never
+followed. `CONTROL_DIR` must be owned by root with mode 0700, and diskwarden
+enforces this.
+
 `MOUNTED_FLAG_DIR` can be inside the mount point, which puts the flag on the
 disk itself. For FAT and exFAT disks, set `uid=`, `gid=` and `umask=` in
-`MOUNT_OPTIONS` so the user can write to the disk. `SAFE_FLAG_DIR` must never
-be on the disk.
+`MOUNT_OPTIONS` so the user can write to the disk. `SAFE_FLAG_DIR` and
+`WARNING_FLAG_DIR` must never be on the disk.
 
 ## Notes for AlmaLinux 10
 
-* **SELinux.** The unit starts the script with `/usr/bin/bash`, so the script
-  runs as `unconfined_service_t` even though it lives under `/etc`. The
-  installer runs `restorecon` on the installed files.
+* **SELinux.** The unit starts the script with `/usr/bin/bash`, so it runs as
+  `unconfined_service_t` whatever the SELinux label of `PROGRAM_DIR`. The
+  installer runs `restorecon` on everything it installs.
 * **Sandboxing.** Do not add sandboxing options to the unit, such as
   `PrivateTmp`, `ProtectSystem` or `ProtectHome`. They create a private mount
   namespace, which would hide the mounts from the rest of the system.
+* **Filesystem support.** ext4, xfs, vfat and exfat work out of the box. NTFS
+  needs `ntfs-3g` from EPEL; set `FS_TYPE=ntfs-3g` for such disks. Without it,
+  diskwarden writes the "not supported" warning flag.
+* **fsck for XFS.** `fsck.xfs` does nothing by design, so `FSCK=yes` gives no
+  protection for XFS disks. Use `xfs_repair` manually if needed.
 * **Desktop automounting.** On GNOME, udisks2 may also mount the disk under
   `/run/media/...`. diskwarden logs a warning when this happens. To stop it,
   add a udev rule that sets `UDISKS_IGNORE`, for example in
   `/etc/udev/rules.d/99-diskwarden.rules`:
   `ENV{ID_FS_UUID}=="<UUID>", ENV{UDISKS_IGNORE}="1"`
 * **fstab.** Do not add these disks to `/etc/fstab`.
-* **Dependencies.** The script only needs `util-linux`, `coreutils`,
-  `findutils` and `systemd`, which are all part of a minimal install. `fuser`
-  (from `psmisc`) is optional. If installed, the error report for a busy disk
-  lists the processes that are using it.
+* **Dependencies.** The script only needs `util-linux`, `coreutils`, `kmod` and
+  `systemd`, which are all part of a minimal install. `fuser` (from `psmisc`)
+  is optional. If installed, the error report for a busy disk lists the
+  processes that are using it.
