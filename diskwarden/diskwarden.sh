@@ -21,7 +21,7 @@ set -uo pipefail
 shopt -s nullglob extglob
 
 readonly PROG=diskwarden
-readonly VERSION=2.0.0
+readonly VERSION=2.1.0
 
 CONF_FILE=${DISKWARDEN_CONF:-/etc/diskwarden/diskwarden.conf}
 LOCK_FILE=${DISKWARDEN_LOCK:-/run/diskwarden.lock}
@@ -66,12 +66,15 @@ declare -A MOUNT_KEY_DEFAULTS=(
     [FSCK_OPTIONS]="-p"
     [FSCK_UNSUPPORTED_ACTION]="mount"
     [MOUNTED_FLAG_DIR]="/run/diskwarden/flags"
-    [MOUNTED_FLAG_NAME]="%NAME%.MOUNTED"
+    [MOUNTED_WORD]="MOUNTED"
+    [SAFE_WORD]="SAFE_TO_DISCONNECT"
+    [WARNING_WORD]="WARNING"
+    [MOUNTED_FLAG_NAME]="%NAME%.%STATUS%"
     [SAFE_FLAG_DIR]="/run/diskwarden/flags"
-    [SAFE_FLAG_NAME]="%NAME%.SAFE_TO_DISCONNECT.%TS%"
+    [SAFE_FLAG_NAME]="%NAME%.%STATUS%.%TS%"
     [SAFE_FLAG_TTL]="300"
     [WARNING_FLAG_DIR]="/run/diskwarden/flags"
-    [WARNING_FLAG_NAME]="%NAME%.WARNING"
+    [WARNING_FLAG_NAME]="%NAME%.%STATUS%"
     [WARNING_FLAG_TTL]="0"
     [TIMESTAMP_FORMAT]="%Y-%m-%d_%H-%M-%S"
     [FLAG_OWNER]=""
@@ -83,6 +86,8 @@ declare -A MOUNT_KEY_DEFAULTS=(
     [ON_WARNING]=""
     [ON_ERROR]=""
     [HOOK_TIMEOUT]="60"
+    [AUDIT_LOG]=""
+    [AUDIT_JOURNAL_IDENTIFIER]="smbd_audit"
 )
 
 # Parser output (raw, per section): P["section|KEY"]=value ; PM=(mount names)
@@ -203,7 +208,7 @@ resolve_config() {
             fi
             # Placeholders usable in names and directories.
             case $k in
-                *_FLAG_NAME|*_FLAG_DIR|MOUNT_POINT)
+                *_FLAG_NAME|*_FLAG_DIR|*_WORD|MOUNT_POINT)
                     v=${v//%NAME%/$m}
                     v=${v//%UUID%/${P["$m|UUID"]-}}
                     ;;
@@ -249,7 +254,13 @@ resolve_config() {
                 err "$pre ${t}_FLAG_DIR must not be on the disk itself (inside $mp)"; ((errors++))
             fi
 
-            v=${NR["$m|${t}_FLAG_NAME"]}
+            # %STATUS% = the user-facing word of this flag type.
+            v=${NR["$m|${t}_WORD"]}
+            if [[ -z $v || $v == */* || $v == *[%\*\?\[\]]* ]]; then
+                err "$pre ${t}_WORD must be non-empty and must not contain / % * ? [ ]"; ((errors++))
+            fi
+            v=${NR["$m|${t}_FLAG_NAME"]//%STATUS%/$v}
+            NR["$m|${t}_FLAG_NAME"]=$v
             if [[ -z $v || $v == */* || $v == . || $v == .. || $v == .diskwarden.* ]]; then
                 err "$pre ${t}_FLAG_NAME must be a plain file name"; ((errors++))
             elif [[ $v == *[\*\?\[\]]* ]]; then
@@ -290,6 +301,10 @@ resolve_config() {
                 *) err "$pre $k must be yes or no"; ((errors++)) ;;
             esac
         done
+        v=${NR["$m|AUDIT_LOG"]}
+        if [[ -n $v && $v != journal && $v != /* ]]; then
+            err "$pre AUDIT_LOG must be empty, 'journal' or an absolute file path"; ((errors++))
+        fi
         case ${NR["$m|FSCK_UNSUPPORTED_ACTION"],,} in
             mount|skip) ;;
             *) err "$pre FSCK_UNSUPPORTED_ACTION must be mount or skip"; ((errors++)) ;;
@@ -349,6 +364,8 @@ print_config() {
         printf '  warning flag  : %s/%s (kept %s)\n' \
             "${R["$m|WARNING_FLAG_DIR"]}" "${R["$m|WARNING_FLAG_NAME"]}" \
             "$( ((${R["$m|WARNING_FLAG_TTL"]})) && echo "${R["$m|WARNING_FLAG_TTL"]}s" || echo "until disconnected")"
+        [[ -n ${R["$m|AUDIT_LOG"]} ]] && printf '  who deleted   : from Samba audit log %s%s\n' "${R["$m|AUDIT_LOG"]}" \
+            "$([[ ${R["$m|AUDIT_LOG"]} == journal ]] && echo " (identifier ${R["$m|AUDIT_JOURNAL_IDENTIFIER"]})")"
         local h
         for h in ON_MOUNT ON_UNMOUNT ON_DISCONNECT ON_WARNING ON_ERROR; do
             [[ -n ${R["$m|$h"]} ]] && printf '  %-13s : %s\n' "$h" "${R["$m|$h"]}"
@@ -470,56 +487,6 @@ write_flag() {
     return $rc
 }
 
-create_mounted_flag() {
-    local m=$1 note=${2:-} text
-    text="Disk '$m' (UUID ${R["$m|UUID"]}) is MOUNTED at ${R["$m|MOUNT_POINT"]}
-Mounted since: $(date '+%F %T %Z')
-
-Delete this file to unmount the disk safely.
-When unmounting has finished, a file named like
-  $(flag_path "$m" SAFE '<time>')
-appears; the disk can then be disconnected."
-    [[ -n $note ]] && text+=$'\n\n'"$note"
-    write_flag "$m" "$(flag_path "$m" MOUNTED)" "$text"
-}
-
-# Time stamp for %TS% (epoch $2) of mount $1.
-timestamp() { printf "%(${R["$1|TIMESTAMP_FORMAT"]})T" "$2"; }
-
-create_safe_flag() {
-    local m=$1 now path ttl=${R["$1|SAFE_FLAG_TTL"]}
-    now=$(date +%s)
-    path=$(flag_path "$m" SAFE "$(timestamp "$m" "$now")")
-    write_flag "$m" "$path" \
-"Disk '$m' (UUID ${R["$m|UUID"]}) was UNMOUNTED from ${R["$m|MOUNT_POINT"]}
-Unmounted at: $(date -d "@$now" '+%F %T %Z')
-
-It is now SAFE TO DISCONNECT the disk.
-This notice is removed automatically at $(date -d "@$((now + ttl))" '+%F %T %Z')." \
-        && log "[$m] safe-to-disconnect flag created: $path (expires in ${ttl}s)"
-}
-
-# create_warning_flag MOUNT TEXT
-create_warning_flag() {
-    local m=$1 text=$2 now path ttl=${R["$1|WARNING_FLAG_TTL"]}
-    now=$(date +%s)
-    remove_flags "$m" WARNING
-    path=$(flag_path "$m" WARNING "$(timestamp "$m" "$now")")
-    text="WARNING for disk '$m' (UUID ${R["$m|UUID"]}, mount point ${R["$m|MOUNT_POINT"]})
-Time: $(date -d "@$now" '+%F %T %Z')
-
-$text
-"
-    if ((ttl > 0)); then
-        text+="
-This notice is removed automatically at $(date -d "@$((now + ttl))" '+%F %T %Z')."
-    else
-        text+="
-This notice is removed when the disk is disconnected or mounted successfully."
-    fi
-    write_flag "$m" "$path" "$text" && log "[$m] warning flag created: $path"
-}
-
 # run_hook MOUNT EVENT MESSAGE  - run ON_<EVENT> in the background.
 # Values are passed as environment variables, never substituted into the
 # command, so they cannot inject shell code.
@@ -535,6 +502,7 @@ run_hook() {
         DISKWARDEN_DEVICE=$(readlink -f "$(device_path "$m")" 2>/dev/null)
         export DISKWARDEN_MOUNT_POINT=${R["$m|MOUNT_POINT"]}
         export DISKWARDEN_MESSAGE=$msg
+        export DISKWARDEN_REQUESTED_BY=${WHO[$m]:-}
         export DISKWARDEN_MOUNTED_FLAG
         DISKWARDEN_MOUNTED_FLAG=$(flag_path "$m" MOUNTED)
         local out rc
@@ -551,6 +519,230 @@ run_hook() {
 }
 
 # ---------------------------------------------------------------------------
+# Flag file reports
+#
+# Every flag file is a small report for the user who finds it on the share:
+# a headline, what to do, the disk, its space, and every step diskwarden ran
+# with exit codes and output.
+# ---------------------------------------------------------------------------
+
+declare -A STEPS=()    # mount -> steps of the operation in progress
+declare -A MSTEPS=()   # mount -> steps of the last successful mount
+declare -A DINFO=()    # mount -> disk details (taken when the disk is seen)
+declare -A DFINFO=()   # mount -> space usage snapshot
+declare -A WHO=()      # mount -> who requested the last unmount
+
+readonly RULE_HEAVY="======================================================================"
+readonly RULE_LIGHT="----------------------------------------------------------------------"
+
+# Time stamp for %TS% (epoch $2) of mount $1.
+timestamp() { printf "%(${R["$1|TIMESTAMP_FORMAT"]})T" "$2"; }
+
+banner()  { printf '%s\n  %s\n%s\n' "$RULE_HEAVY" "$1" "$RULE_HEAVY"; }
+section() { local t="--- $1 "; printf '\n%s%s\n' "$t" "${RULE_LIGHT:${#t}}"; }
+kv()      { [[ -n $2 ]] && printf '  %-14s %s\n' "$1" "$2"; return 0; }
+indent()  { sed 's/^/  /'; }
+footer() {
+    printf '\n%s\n  diskwarden %s on %s, file written %s\n' \
+        "$RULE_LIGHT" "$VERSION" "${HOSTNAME:-localhost}" "$(date '+%F %T %Z')"
+}
+
+steps_reset() { STEPS[$1]=""; }
+
+# step MOUNT DESCRIPTION [EXIT_CODE [MEANING [OUTPUT]]]
+# Records one step for the flag files; output is limited to 15 lines.
+step() {
+    local m=$1 desc=$2 rc=${3-} meaning=${4-} out=${5-} s
+    s="  $(date +%T)  $desc"$'\n'
+    if [[ -n $rc ]]; then
+        s+="            -> exit $rc${meaning:+  ($meaning)}"$'\n'
+    elif [[ -n $meaning ]]; then
+        s+="            -> $meaning"$'\n'
+    fi
+    if [[ -n $out ]]; then
+        s+=$(head -n 15 <<< "$out" | sed 's/^/            | /')$'\n'
+        (($(wc -l <<< "$out") > 15)) && s+="            | ... (truncated, see journalctl -u diskwarden)"$'\n'
+    fi
+    STEPS[$m]+=$s
+}
+
+# Collect disk details (type, label, size, model) while the device exists.
+collect_disk_info() {
+    local m=$1 dev=$2 type=$3 label="" size="" model="" pk=""
+    label=$(blkid -p -o value -s LABEL -- "$dev" 2>/dev/null)
+    if command -v lsblk >/dev/null; then
+        size=$(lsblk -dno SIZE -- "$dev" 2>/dev/null | tr -d ' ')
+        pk=$(lsblk -no PKNAME -- "$dev" 2>/dev/null | head -n 1 | tr -d ' ')
+        [[ -n $pk ]] && model=$(lsblk -dno VENDOR,MODEL -- "/dev/$pk" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+    fi
+    DINFO[$m]=$(
+        kv "Name"        "$m"
+        kv "UUID"        "${R["$m|UUID"]}"
+        kv "Device"      "$dev"
+        kv "Filesystem"  "${type:-unknown}${label:+, label \"$label\"}"
+        kv "Size"        "$size"
+        kv "Model"       "$model"
+        kv "Mount point" "${R["$m|MOUNT_POINT"]}"
+        kv "Options"     "${R["$m|MOUNT_OPTIONS"]}"
+    )
+}
+
+# Snapshot of space usage on the mounted disk.
+collect_df() {
+    local m=$1 mp=${R["$1|MOUNT_POINT"]} size used avail pcent iused ipcent
+    read -r size used avail pcent < <(df -h --output=size,used,avail,pcent -- "$mp" 2>/dev/null | tail -n 1)
+    read -r iused ipcent < <(df --output=iused,ipcent -- "$mp" 2>/dev/null | tail -n 1)
+    if [[ -z $size ]]; then
+        DFINFO[$m]="  (not available)"
+        return
+    fi
+    DFINFO[$m]=$(
+        kv "Total"     "$size"
+        kv "Used"      "$used ($pcent)"
+        kv "Free"      "$avail"
+        [[ $ipcent != - ]] && kv "Files/dirs" "$iused inodes used ($ipcent)"
+        printf '  %s\n' "$(usage_bar "${pcent%\%}")"
+    )
+}
+
+# usage_bar PERCENT -> [##########----------] 50 %
+usage_bar() {
+    local p=${1:-0} n bar=""
+    [[ $p =~ ^[0-9]+$ ]] || p=0
+    n=$((p * 40 / 100))
+    printf -v bar '%*s' "$n" ''
+    bar=${bar// /#}
+    printf -v bar '%-40s' "$bar"
+    printf '[%s] %s%% used' "${bar// /.}" "$p"
+}
+
+create_mounted_flag() {
+    local m=$1 failure=${2:-} text safe_example
+    safe_example=$(flag_path "$m" SAFE '<time>')
+    text=$(
+        banner "DISK \"$m\" IS MOUNTED - do not unplug it now"
+        section "WHAT TO DO"
+        printf '%s\n' \
+            "  The disk is in use. Its files are at ${R["$m|MOUNT_POINT"]}." \
+            "" \
+            "  When you have finished, DELETE THIS FILE. The disk is then unmounted" \
+            "  and a file named" \
+            "      ${safe_example##*/}" \
+            "  appears in ${safe_example%/*} (usually within seconds)." \
+            "  Unplug the disk only after that file has appeared."
+        if [[ -n $failure ]]; then
+            section "LAST UNMOUNT ATTEMPT FAILED"
+            printf '%s\n' "$failure" | indent
+            printf '\n%s\n' "${STEPS[$m]}"
+        fi
+        section "DISK"
+        printf '%s\n' "${DINFO[$m]}"
+        section "SPACE (at mount time)"
+        printf '%s\n' "${DFINFO[$m]}"
+        section "WHAT DISKWARDEN DID TO MOUNT IT"
+        printf '%s' "${MSTEPS[$m]:-  (disk was already mounted when diskwarden started)
+}"
+        footer
+    )
+    write_flag "$m" "$(flag_path "$m" MOUNTED)" "$text"
+}
+
+create_safe_flag() {
+    local m=$1 now path text ttl=${R["$1|SAFE_FLAG_TTL"]}
+    now=$(date +%s)
+    path=$(flag_path "$m" SAFE "$(timestamp "$m" "$now")")
+    text=$(
+        banner "DISK \"$m\" IS UNMOUNTED - SAFE TO DISCONNECT"
+        section "WHAT TO DO"
+        printf '%s\n' \
+            "  You can unplug the disk now." \
+            "  To use it again, plug it in again; it is mounted automatically." \
+            "" \
+            "  This notice is removed at $(date -d "@$((now + ttl))" '+%F %T') (after ${ttl}s)."
+        if [[ -n ${WHO[$m]:-} ]]; then
+            section "UNMOUNT REQUESTED BY"
+            printf '  %s\n' "${WHO[$m]}"
+        fi
+        section "DISK"
+        printf '%s\n' "${DINFO[$m]}"
+        section "SPACE (just before unmounting)"
+        printf '%s\n' "${DFINFO[$m]}"
+        section "WHAT DISKWARDEN DID TO UNMOUNT IT"
+        printf '%s' "${STEPS[$m]}"
+        footer
+    )
+    write_flag "$m" "$path" "$text" \
+        && log "[$m] safe-to-disconnect flag created: $path (expires in ${ttl}s)"
+}
+
+# create_warning_flag MOUNT HEADLINE WHAT_HAPPENED WHAT_TO_DO
+create_warning_flag() {
+    local m=$1 headline=$2 what=$3 todo=$4 now path text ttl=${R["$1|WARNING_FLAG_TTL"]}
+    now=$(date +%s)
+    remove_flags "$m" WARNING
+    path=$(flag_path "$m" WARNING "$(timestamp "$m" "$now")")
+    text=$(
+        banner "DISK \"$m\": $headline"
+        section "WHAT HAPPENED"
+        printf '%s\n' "$what" | fold -s -w 66 | sed "s/ *$//" | indent
+        section "WHAT TO DO"
+        printf '%s\n' "$todo" | fold -s -w 66 | sed "s/ *$//" | indent
+        if ((ttl > 0)); then
+            printf '\n  This notice is removed at %s.\n' "$(date -d "@$((now + ttl))" '+%F %T')"
+        else
+            printf '\n  This notice is removed when the disk is disconnected or mounted.\n'
+        fi
+        section "DISK"
+        printf '%s\n' "${DINFO[$m]}"
+        section "WHAT DISKWARDEN DID"
+        printf '%s' "${STEPS[$m]}"
+        footer
+    )
+    write_flag "$m" "$path" "$text" && log "[$m] warning flag created: $path"
+}
+
+# ---------------------------------------------------------------------------
+# Who deleted the mounted flag? (optional, from Samba full_audit logs)
+# ---------------------------------------------------------------------------
+
+# find_requester MOUNT SINCE_EPOCH -> prints a description or nothing.
+#
+# Reads Samba "vfs objects = full_audit" records, e.g. with
+#   full_audit:prefix = %u|%I|%m|%S   full_audit:success = unlinkat renameat
+# a record looks like  alice|192.168.1.20|pc-alice|disks|unlinkat|ok|backup1_MOUNTED
+find_requester() {
+    local m=$1 since=$2 src=${R["$1|AUDIT_LOG"]} name lines line
+    [[ -n $src ]] || return 0
+    name=$(flag_path "$m" MOUNTED); name=${name##*/}
+
+    if [[ $src == journal ]]; then
+        command -v journalctl >/dev/null || return 0
+        lines=$(journalctl -q --no-pager -o cat --since "@$since" \
+                    -t "${R["$m|AUDIT_JOURNAL_IDENTIFIER"]}" 2>/dev/null)
+    else
+        [[ -r $src ]] || return 0
+        lines=$(tail -n 5000 -- "$src" 2>/dev/null)
+    fi
+
+    line=$(grep -E "\|(unlink|unlinkat|rename|renameat)\|ok\|" <<< "$lines" \
+           | grep -F -- "$name" | tail -n 1)
+    [[ -n $line ]] || return 0
+    line=${line#*: }                     # drop a syslog "host prog[pid]: " head
+
+    local -a f; local i op=-1
+    IFS='|' read -r -a f <<< "$line"
+    for i in "${!f[@]}"; do
+        [[ ${f[i]} == @(unlink|unlinkat|rename|renameat) ]] && { op=$i; break; }
+    done
+    if ((op == 4)); then                 # %u|%I|%m|%S
+        printf 'user "%s" from %s (computer %s), share "%s"' "${f[0]}" "${f[1]}" "${f[2]}" "${f[3]}"
+    elif ((op > 0)); then
+        local IFS='|'
+        printf '%s' "${f[*]:0:op}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
@@ -558,6 +750,7 @@ declare -A STATE=()    # mount -> absent | mounted | released | failed
 declare -A SINCE=()    # mount -> epoch of last state change
 declare -A LASTMSG=()  # mount -> last notable event
 declare -A PRESENT=()  # mount -> 1 if the disk is connected
+declare -A FLAG_SEEN=() # mount -> last epoch the mounted flag was seen
 
 set_state() {
     local m=$1 s=$2
@@ -574,11 +767,10 @@ set_state() {
 fail_mount() {
     local m=$1 kind=$2 msg=$3 advice=${4:-}
     if [[ $kind == WARNING ]]; then warn "[$m] $msg"; else err "[$m] $msg"; fi
-    create_warning_flag "$m" "$msg${advice:+
+    create_warning_flag "$m" "NOT MOUNTED" "$msg" \
+        "${advice:+$advice
 
-$advice}
-
-The disk was NOT mounted. It can be disconnected."
+}The disk was NOT mounted and can be disconnected at any time."
     set_state "$m" failed "$msg"
     run_hook "$m" "$kind" "$msg"
 }
@@ -599,14 +791,37 @@ detect_fstype() {
 
 # Can this system mount filesystem type $1? (kernel driver loaded, module
 # available, or a userspace mount helper such as mount.ntfs-3g installed)
+# Sets FS_SUPPORT to a description of how.
 fs_supported() {
     local type=$1 f
+    FS_SUPPORT=""
     while read -r f; do
-        [[ ${f##*[[:space:]]} == "$type" ]] && return 0
+        [[ ${f##*[[:space:]]} == "$type" ]] && { FS_SUPPORT="kernel driver loaded"; return 0; }
     done < /proc/filesystems
-    [[ -x /usr/sbin/mount.$type || -x /sbin/mount.$type ]] && return 0
-    command -v modprobe >/dev/null && modprobe -n -q -- "$type" 2>/dev/null && return 0
+    for f in /usr/sbin/mount."$type" /sbin/mount."$type"; do
+        [[ -x $f ]] && { FS_SUPPORT="mount helper $f"; return 0; }
+    done
+    if command -v modprobe >/dev/null && modprobe -n -q -- "$type" 2>/dev/null; then
+        FS_SUPPORT="kernel module available"
+        return 0
+    fi
+    FS_SUPPORT="no kernel driver, module or mount helper"
     return 1
+}
+
+# Meaning of an fsck exit code (bit mask, see fsck(8)).
+fsck_meaning() {
+    local rc=$1 s=()
+    ((rc == 0)) && { echo "no errors"; return; }
+    ((rc & 1))   && s+=("errors corrected")
+    ((rc & 2))   && s+=("system should be rebooted")
+    ((rc & 4))   && s+=("errors left uncorrected")
+    ((rc & 8))   && s+=("operational error")
+    ((rc & 16))  && s+=("usage or syntax error")
+    ((rc & 32))  && s+=("cancelled by user")
+    ((rc & 128)) && s+=("shared library error")
+    local IFS=','
+    echo "${s[*]}" | sed 's/,/, /g'
 }
 
 # run_fsck MOUNT DEVICE FSTYPE ; returns 0 if mounting may proceed.
@@ -617,15 +832,17 @@ run_fsck() {
 
     if ! command -v "fsck.$type" >/dev/null; then
         msg="Filesystem type '$type' cannot be checked: fsck.$type is not installed."
+        step "$m" "look for fsck.$type" "" "not installed"
         if [[ ${R["$m|FSCK_UNSUPPORTED_ACTION"],,} == skip ]]; then
             fail_mount "$m" WARNING "$msg" \
                 "Install the fsck tool for '$type', or set FSCK=no or FSCK_UNSUPPORTED_ACTION=mount for this disk."
             return 1
         fi
         warn "[$m] $msg Mounting without a check."
-        create_warning_flag "$m" "$msg
-The disk was mounted WITHOUT a filesystem check.
-Install the fsck tool for '$type' or set FSCK=no for this disk."
+        step "$m" "skip the filesystem check" "" "FSCK_UNSUPPORTED_ACTION=mount"
+        WARN_PENDING=("MOUNTED WITHOUT FILESYSTEM CHECK" "$msg
+The disk was mounted anyway (FSCK_UNSUPPORTED_ACTION=mount) and can be used normally." \
+            "Nothing, if you trust the disk. To have it checked, install the fsck tool for '$type'. To silence this notice, set FSCK=no for this disk.")
         LASTMSG[$m]="mounted without fsck (no fsck.$type)"
         run_hook "$m" WARNING "$msg"
         return 0
@@ -634,12 +851,13 @@ Install the fsck tool for '$type' or set FSCK=no for this disk."
     log "[$m] checking filesystem: fsck ${opts[*]} -t $type $dev"
     out=$(fsck "${opts[@]}" -t "$type" "$dev" 2>&1)
     rc=$?
+    step "$m" "fsck ${opts[*]} -t $type $dev" "$rc" "$(fsck_meaning "$rc")" "$out"
     case $rc in
         0) log "[$m] filesystem is clean" ;;
         1) warn "[$m] fsck corrected filesystem errors: $out"
            LASTMSG[$m]="fsck corrected errors" ;;
-        *) fail_mount "$m" ERROR "Filesystem check failed (fsck exit code $rc): $out" \
-               "Repair the filesystem manually (e.g. fsck -t $type $dev), then run 'diskwarden --mount $m' or reconnect the disk."
+        *) fail_mount "$m" ERROR "The filesystem check failed: fsck exit code $rc ($(fsck_meaning "$rc"))." \
+               "Have an administrator repair the filesystem (fsck -t $type $dev), then run 'diskwarden --mount $m' or reconnect the disk."
            return 1 ;;
     esac
 }
@@ -649,43 +867,57 @@ Install the fsck tool for '$type' or set FSCK=no for this disk."
 # ---------------------------------------------------------------------------
 
 do_mount() {
-    local m=$1 dev mp=${R["$1|MOUNT_POINT"]} out other type
+    local m=$1 dev mp=${R["$1|MOUNT_POINT"]} out rc other type
     dev=$(readlink -f "$(device_path "$m")")
     log "[$m] disk UUID ${R["$m|UUID"]} detected ($dev)"
+    steps_reset "$m"
+    WARN_PENDING=()
+    step "$m" "disk UUID ${R["$m|UUID"]} connected as $dev"
 
     # Let udev finish probing the new device before mounting it.
     command -v udevadm >/dev/null && udevadm settle --timeout=10 2>/dev/null
 
     type=$(detect_fstype "$m" "$dev")
+    collect_disk_info "$m" "$dev" "$type"
+    if [[ ${R["$m|FS_TYPE"]} == auto ]]; then
+        step "$m" "blkid -p $dev (detect filesystem)" "" "${type:-no filesystem found}"
+    fi
     if [[ -z $type ]]; then
-        fail_mount "$m" WARNING "No recognisable filesystem found on $dev." \
-            "The disk may be empty, encrypted or damaged."
+        fail_mount "$m" WARNING "No recognisable filesystem was found on the disk ($dev)." \
+            "The disk may be empty, encrypted or damaged. Check it on another computer or ask an administrator."
         return 1
     fi
-    if ! fs_supported "$type"; then
-        fail_mount "$m" WARNING "Filesystem type '$type' is not supported by this system (no kernel driver or mount helper)." \
-            "Install support for '$type' (e.g. a kernel module or mount.$type package) and reconnect the disk, or reformat it."
+    fs_supported "$type"; rc=$?
+    step "$m" "check system support for '$type'" "" "$FS_SUPPORT"
+    if ((rc != 0)); then
+        fail_mount "$m" WARNING "This server cannot read the filesystem type '$type' ($FS_SUPPORT)." \
+            "Ask an administrator to install support for '$type' (a kernel module or mount.$type helper), then reconnect the disk. Or reformat the disk with a supported filesystem such as ext4, xfs or exfat."
         return 1
     fi
 
     if [[ ! -d $mp ]]; then
         if ! is_yes "${R["$m|CREATE_MOUNT_POINT"]}"; then
-            fail_mount "$m" ERROR "Mount point $mp does not exist (CREATE_MOUNT_POINT=no)."
+            fail_mount "$m" ERROR "The mount point $mp does not exist (CREATE_MOUNT_POINT=no)." \
+                "Ask an administrator to create $mp."
             return 1
-        elif ! mkdir -p -- "$mp"; then
-            fail_mount "$m" ERROR "Cannot create mount point $mp."
+        elif ! out=$(mkdir -p -- "$mp" 2>&1); then
+            step "$m" "mkdir -p $mp" 1 "" "$out"
+            fail_mount "$m" ERROR "The mount point $mp could not be created." "Ask an administrator."
             return 1
         fi
+        step "$m" "mkdir -p $mp" 0
     fi
 
     if [[ -n $(mount_source "$mp") ]]; then
-        fail_mount "$m" ERROR "$mp is already used by another mount ($(mount_source "$mp"))."
+        fail_mount "$m" ERROR "$mp is already used by another mount ($(mount_source "$mp"))." \
+            "Ask an administrator to unmount it."
         return 1
     fi
 
     other=$(findmnt -rn -o TARGET --source "$dev" 2>/dev/null | head -n 1)
     if [[ -n $other ]]; then
         warn "[$m] $dev is also mounted at $other (desktop automounter?)"
+        step "$m" "note: $dev is also mounted at $other"
     fi
 
     # Clear warnings from an earlier attempt; fsck may create a new one.
@@ -694,59 +926,95 @@ do_mount() {
 
     if is_yes "${R["$m|FSCK"]}"; then
         run_fsck "$m" "$dev" "$type" || return 1
+    else
+        step "$m" "filesystem check" "" "disabled (FSCK=no)"
     fi
 
     local -a cmd=(mount)
     [[ ${R["$m|FS_TYPE"]} != auto ]] && cmd+=(-t "${R["$m|FS_TYPE"]}")
     cmd+=(-o "${R["$m|MOUNT_OPTIONS"]}" -- "$dev" "$mp")
 
-    if ! out=$("${cmd[@]}" 2>&1); then
+    out=$("${cmd[@]}" 2>&1); rc=$?
+    step "$m" "${cmd[*]}" "$rc" "$( ((rc == 0)) && echo "mounted" || echo "failed")" "$out"
+    if ((rc != 0)); then
         if [[ $out == *"unknown filesystem type"* ]]; then
-            fail_mount "$m" WARNING "Filesystem type '$type' is not supported by this system: $out" \
-                "Install support for '$type' and reconnect the disk, or reformat it."
+            fail_mount "$m" WARNING "This server cannot read the filesystem type '$type'." \
+                "Ask an administrator to install support for '$type', then reconnect the disk. Or reformat the disk."
         else
-            fail_mount "$m" ERROR "Mount failed: ${out:-unknown error}" \
-                "Check the journal (journalctl -u diskwarden), then run 'diskwarden --mount $m' or reconnect the disk."
+            fail_mount "$m" ERROR "Mounting failed: ${out:-unknown error}" \
+                "Reconnect the disk to try again. If the problem stays, ask an administrator (journalctl -u diskwarden)."
         fi
         return 1
     fi
 
     remove_flags "$m" SAFE
+    collect_df "$m"
+    MSTEPS[$m]=${STEPS[$m]}
     create_mounted_flag "$m"
+    ((${#WARN_PENDING[@]})) && create_warning_flag "$m" "${WARN_PENDING[@]}"
+    FLAG_SEEN[$m]=$(date +%s)
     set_state "$m" mounted "${LASTMSG[$m]:-mounted ($type)}"
     log "[$m] mounted $dev ($type) at $mp; delete $(flag_path "$m" MOUNTED) to unmount"
     run_hook "$m" MOUNT "mounted $dev at $mp"
 }
 
+# do_unmount MOUNT [REQUESTED_BY]
 do_unmount() {
-    local m=$1 mp=${R["$1|MOUNT_POINT"]} out i tries=${R["$1|UMOUNT_RETRIES"]}
-    log "[$m] unmount requested, unmounting $mp"
-    sync -f -- "$mp" 2>/dev/null || sync
+    local m=$1 by=${2:-} mp=${R["$1|MOUNT_POINT"]} out rc i tries=${R["$1|UMOUNT_RETRIES"]}
+    steps_reset "$m"
+    if [[ -z $by ]]; then
+        step "$m" "mounted flag $(flag_path "$m" MOUNTED) was deleted"
+    else
+        step "$m" "unmount requested: $by"
+    fi
+    log "[$m] unmount requested${by:+ ($by)}, unmounting $mp"
+    collect_df "$m"
+    out=$(sync -f -- "$mp" 2>&1); rc=$?
+    step "$m" "sync -f $mp (write cached data to the disk)" "$rc" "" "$out"
 
     for ((i = 0; i <= tries; i++)); do
         ((i > 0)) && sleep 1
-        if out=$(umount -- "$mp" 2>&1); then
-            log "[$m] unmounted $mp"
-            set_state "$m" released "unmounted"
-            create_safe_flag "$m"
-            run_hook "$m" UNMOUNT "unmounted $mp"
-            return 0
-        fi
+        out=$(umount -- "$mp" 2>&1); rc=$?
+        step "$m" "umount $mp (attempt $((i + 1)) of $((tries + 1)))" "$rc" \
+            "$( ((rc == 0)) && echo "unmounted" || echo "failed")" "$out"
+        ((rc == 0)) && break
     done
+
+    if ((rc == 0)); then
+        if [[ -z $by ]]; then
+            # The audit record may reach the log a moment after the deletion.
+            by=$(find_requester "$m" "$((${FLAG_SEEN[$m]:-$(date +%s)} - 2))")
+            if [[ -z $by && -n ${R["$m|AUDIT_LOG"]} ]]; then
+                sleep 1
+                by=$(find_requester "$m" "$((${FLAG_SEEN[$m]:-$(date +%s)} - 2))")
+            fi
+            [[ -n ${R["$m|AUDIT_LOG"]} ]] && by=${by:-unknown (no matching Samba audit record; deleted locally?)}
+            [[ -n $by ]] && by="$by - deleted the mounted flag"
+        fi
+        WHO[$m]=$by
+        log "[$m] unmounted $mp${by:+; requested by $by}"
+        set_state "$m" released "unmounted${by:+ (by ${by%% - *})}"
+        create_safe_flag "$m"
+        run_hook "$m" UNMOUNT "unmounted $mp"
+        return 0
+    fi
 
     local users=""
     if command -v fuser >/dev/null; then
         users=$(fuser -vm "$mp" 2>&1 | tail -n +2)
+        step "$m" "fuser -vm $mp (who is using the disk)" "" "" "$users"
     fi
     err "[$m] unmount of $mp failed: ${out:-unknown error}"
     [[ -n $users ]] && err "[$m] processes using $mp:"$'\n'"$users"
     LASTMSG[$m]="unmount failed: ${out:-unknown error}"
     # Put the flag back so the user sees the disk is still mounted and can
     # retry by deleting it again.
-    create_mounted_flag "$m" "LAST UNMOUNT ATTEMPT FAILED at $(date '+%F %T'): ${out:-unknown error}
-Close all programs using ${R["$m|MOUNT_POINT"]} and delete this file again.
-${users:+Processes using the disk:
-$users}"
+    create_mounted_flag "$m" "At $(date '+%F %T') the disk could not be unmounted:
+  ${out:-unknown error}
+The disk is STILL MOUNTED - do not unplug it.
+Close all programs and files that use ${R["$m|MOUNT_POINT"]},
+then delete this file again."
+    FLAG_SEEN[$m]=$(date +%s)
     run_hook "$m" ERROR "unmount of $mp failed: ${out:-unknown error}"
 }
 
@@ -761,18 +1029,29 @@ disk_gone() {
 # Take one pending request (mount/unmount) for mount $1, if any.
 take_request() {
     local m=$1 ctl=${R["global|CONTROL_DIR"]} r
-    REQUEST=""
+    REQUEST="" REQUEST_BY=""
     for r in mount unmount; do
         if [[ -e $ctl/$r.$m ]]; then
+            REQUEST_BY=$(head -c 200 -- "$ctl/$r.$m" | tr -cd '[:print:]')
             rm -f -- "$ctl/$r.$m"
             REQUEST=$r
         fi
     done
 }
 
+# Adopt a disk that is already mounted on its mount point.
+take_over() {
+    local m=$1 dev
+    dev=$(readlink -f "$(device_path "$m")")
+    collect_disk_info "$m" "$dev" "$(findmnt -rn -o FSTYPE --mountpoint "${R["$m|MOUNT_POINT"]}" | tail -n 1)"
+    collect_df "$m"
+    MSTEPS[$m]=""
+    FLAG_SEEN[$m]=$(date +%s)
+}
+
 # One poll step for mount $1.
 process_mount() {
-    local m=$1 present=0 here=0 mflag REQUEST
+    local m=$1 present=0 here=0 mflag REQUEST REQUEST_BY
     mflag=$(flag_path "$m" MOUNTED)
     [[ -e $(device_path "$m") ]] && present=1
     ((present)) && is_mounted_here "$m" && here=1
@@ -789,12 +1068,13 @@ process_mount() {
     PRESENT[$m]=$present
 
     take_request "$m"
-    [[ -n $REQUEST ]] && log "[$m] '$REQUEST' requested from the command line"
+    [[ -n $REQUEST ]] && log "[$m] '$REQUEST' requested from the command line${REQUEST_BY:+ by $REQUEST_BY}"
 
     case ${STATE[$m]:-absent} in
         absent)
             if ((here)); then
                 log "[$m] already mounted at ${R["$m|MOUNT_POINT"]}, taking over"
+                take_over "$m"
                 [[ -e $mflag ]] || create_mounted_flag "$m"
                 set_state "$m" mounted "taken over at startup"
             elif ((present)); then
@@ -815,13 +1095,21 @@ process_mount() {
                 LASTMSG[$m]="disconnected while mounted"
             elif ((!here)); then
                 log "[$m] ${R["$m|MOUNT_POINT"]} was unmounted externally"
+                steps_reset "$m"
+                step "$m" "${R["$m|MOUNT_POINT"]} was unmounted outside diskwarden (by an administrator?)"
+                WHO[$m]=""
+                DFINFO[$m]="  (not available - unmounted outside diskwarden)"
                 rm -f -- "$mflag"
                 set_state "$m" released "unmounted externally"
                 create_safe_flag "$m"
                 run_hook "$m" UNMOUNT "unmounted externally"
-            elif [[ ! -e $mflag || $REQUEST == unmount ]]; then
+            elif [[ $REQUEST == unmount ]]; then
                 rm -f -- "$mflag"
+                do_unmount "$m" "${REQUEST_BY:-root} via 'diskwarden --unmount $m'"
+            elif [[ ! -e $mflag ]]; then
                 do_unmount "$m"
+            else
+                FLAG_SEEN[$m]=$(date +%s)
             fi
             ;;
         released|failed)
@@ -831,6 +1119,7 @@ process_mount() {
                 disk_gone "$m"
             elif ((here)); then
                 log "[$m] mounted externally at ${R["$m|MOUNT_POINT"]}, taking over"
+                take_over "$m"
                 remove_flags "$m" SAFE
                 remove_flags "$m" WARNING
                 create_mounted_flag "$m"
@@ -928,7 +1217,7 @@ send_request() {
         return 1
     fi
     daemon_running || { err "$PROG daemon is not running"; return 1; }
-    : > "$ctl/$req.$m" || return 1
+    printf '%s\n' "${SUDO_USER:-${USER:-root}}" > "$ctl/$req.$m" || return 1
     echo "Request '$req $m' sent, waiting for the daemon..."
     for ((i = 0; i < 60; i++)); do
         sleep 1

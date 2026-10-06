@@ -17,7 +17,8 @@ For every disk configured in `/etc/diskwarden/diskwarden.conf`:
    `diskwarden --unmount NAME`). diskwarden syncs and unmounts the disk, then
    creates the **safe flag** `SAFE_FLAG_DIR/SAFE_FLAG_NAME`. The `%TS%` part of
    the name is the creation time, for example
-   `backup1_SAFE_TO_DISCONNECT_2026-10-06_14-25-30`.
+   `backup1_SAFE_TO_DISCONNECT_2026-10-06_14-25-30`. The status words in flag
+   names (`MOUNTED`, `SAFE_TO_DISCONNECT`, `WARNING`) are configurable.
 3. **Safe flag expires.** The safe flag is deleted `SAFE_FLAG_TTL` seconds
    after it was created (default 300 s, or 5 minutes).
 4. **Disk disconnected.** The next time it is connected, it is mounted again.
@@ -51,6 +52,99 @@ Other behaviour:
   diskwarden takes over disks that are already mounted on their mount point.
 * **Configuration reload.** `systemctl reload diskwarden` re-reads the
   configuration. If the new file is invalid, the old configuration stays active.
+
+## What the flag files contain
+
+Every flag file is a short report for the person who finds it on the share:
+
+* **Headline.** For example `DISK "backup1" IS MOUNTED - do not unplug it now`.
+* **What to do.** Plain instructions, including the exact name of the file to
+  wait for.
+* **Disk.** Name, UUID, device, filesystem type and label, size, model, mount
+  point and mount options.
+* **Space.** Total, used, free and inodes, from `df`, with a usage bar. The
+  mounted flag shows the space at mount time; the safe flag shows it just
+  before unmounting.
+* **What diskwarden did.** Every step with its time, command, exit code and
+  meaning (for example `fsck ... -> exit 1 (errors corrected)`) and the first
+  lines of its output. After a failed unmount, this also includes the
+  `fuser` list of processes still using the disk.
+* **Unmount requested by** (safe flag only). The user, IP address and
+  computer that deleted the flag (see below), or the admin who ran
+  `diskwarden --unmount` (taken from `sudo`).
+
+```
+======================================================================
+  DISK "backup1" IS UNMOUNTED - SAFE TO DISCONNECT
+======================================================================
+
+--- WHAT TO DO -------------------------------------------------------
+  You can unplug the disk now.
+  To use it again, plug it in again; it is mounted automatically.
+
+  This notice is removed at 2026-10-06 14:30:36 (after 300s).
+
+--- UNMOUNT REQUESTED BY ---------------------------------------------
+  user "alice" from 192.168.1.20 (computer pc-alice), share "disks" - deleted the mounted flag
+
+--- DISK -------------------------------------------------------------
+  Name           backup1
+  UUID           aaaaaaaa-0000-0000-0000-00000000000a
+  Device         /dev/sdb1
+  Filesystem     ext4, label "Backup Office"
+  Size           931.5G
+  Model          WD Elements 25A3
+  Mount point    /mnt/backup1
+  Options        defaults
+
+--- SPACE (just before unmounting) -----------------------------------
+  Total          916G
+  Used           275G (30%)
+  Free           595G
+  Files/dirs     81234 inodes used (1%)
+  [############............................] 30% used
+
+--- WHAT DISKWARDEN DID TO UNMOUNT IT --------------------------------
+  14:25:36  mounted flag /srv/diskwarden/backup1_MOUNTED was deleted
+  14:25:36  sync -f /mnt/backup1 (write cached data to the disk)
+            -> exit 0
+  14:25:36  umount /mnt/backup1 (attempt 1 of 4)
+            -> exit 0  (unmounted)
+
+----------------------------------------------------------------------
+  diskwarden 2.1.0 on fileserver, file written 2026-10-06 14:25:36 CEST
+```
+
+## Who deleted the flag (optional)
+
+When the flag directory is shared with Samba, diskwarden can name the person
+who deleted the mounted flag. It reads the records of Samba's `full_audit`
+module. Add this to the share in `/etc/samba/smb.conf`:
+
+```
+[disks]
+    path = /srv/diskwarden
+    vfs objects = full_audit
+    full_audit:prefix = %u|%I|%m|%S
+    full_audit:success = unlinkat renameat
+    full_audit:failure = none
+    full_audit:facility = local5
+    full_audit:priority = notice
+```
+
+Then set `AUDIT_LOG=journal` in `diskwarden.conf`. Samba logs these records
+through syslog with the identifier `smbd_audit`, and on AlmaLinux they end up
+in the journal. If rsyslog writes them to a file instead, set `AUDIT_LOG` to
+that file's path.
+
+* **Where the name appears.** In the safe flag, in the journal, in
+  `diskwarden --status`, and in the `ON_UNMOUNT` hook as
+  `DISKWARDEN_REQUESTED_BY`.
+* **No matching record.** For example, if the flag was deleted locally on the
+  server, the safe flag says "unknown".
+* **Prefix format.** With the prefix shown above, the output is formatted as
+  user, IP address, computer and share. With a different prefix, the raw
+  prefix fields are shown instead.
 
 ## Commands
 
@@ -100,11 +194,28 @@ sudo diskwarden --status
 journalctl -u diskwarden -f
 ```
 
-* **Upgrading.** Run `./install.sh` again. An existing config is kept, and the
-  new example is written next to it as `diskwarden.conf.new`. A running
-  service is restarted. Version 1 files in `/etc/diskwarden` are removed.
-* **Uninstalling.** Run `sudo ./install.sh --uninstall`. This keeps
-  `/etc/diskwarden`.
+`install.sh` is **idempotent**: running it again changes nothing if nothing
+changed, and says so.
+
+**Upgrading.** Unpack the new version and run `sudo ./install.sh` again.
+
+* **Config.** Your config is never modified. It is validated with the *new*
+  program first; if it is not valid, the installer stops before changing
+  anything. The new example config is written next to yours as
+  `diskwarden.conf.new` (only when it differs), and settings new in this
+  version are listed. They use built-in defaults until you set them.
+* **Files.** A file is replaced only when its content changes. The service is
+  restarted only if it is running and its program or unit changed.
+* **Cleanup.** Files and directories of the previous installation that are no
+  longer needed are removed. This covers an old `PROGRAM_DIR` or
+  `COMMAND_LINK`, and the version 1 layout in `/etc/diskwarden`. The
+  installer records what it installed in
+  `/var/lib/diskwarden/installed-files`.
+* **Concurrency.** Only one installer can run at a time.
+
+**Uninstalling.** Run `sudo ./install.sh --uninstall`. This removes exactly
+what the installer created, including directories it created if they are
+empty, and keeps `/etc/diskwarden`. Running it again does nothing.
 
 ## Configuration
 
@@ -135,10 +246,13 @@ separate settings.**
 | `FSCK` | `no` | Run fsck before mounting. |
 | `FSCK_OPTIONS` | `-p` | Options passed to fsck. `-p` repairs only what is safe automatically. |
 | `FSCK_UNSUPPORTED_ACTION` | `mount` | `mount` or `skip` when `fsck.<type>` is missing. A warning is written either way. |
-| `MOUNTED_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.MOUNTED` | Mounted flag. |
-| `SAFE_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.SAFE_TO_DISCONNECT.%TS%` | Safe flag. The name must contain `%TS%`. |
+| `MOUNTED_WORD` | `MOUNTED` | Status word for `%STATUS%` in `MOUNTED_FLAG_NAME`. |
+| `SAFE_WORD` | `SAFE_TO_DISCONNECT` | Status word for `%STATUS%` in `SAFE_FLAG_NAME`. |
+| `WARNING_WORD` | `WARNING` | Status word for `%STATUS%` in `WARNING_FLAG_NAME`. |
+| `MOUNTED_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.%STATUS%` | Mounted flag. |
+| `SAFE_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.%STATUS%.%TS%` | Safe flag. The name must contain `%TS%`. |
 | `SAFE_FLAG_TTL` | `300` | Lifetime of the safe flag, in seconds. |
-| `WARNING_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.WARNING` | Warning flag. `%TS%` is optional in the name. |
+| `WARNING_FLAG_DIR` / `_NAME` | `/run/diskwarden/flags` / `%NAME%.%STATUS%` | Warning flag. `%TS%` is optional in the name. |
 | `WARNING_FLAG_TTL` | `0` | Lifetime of the warning flag, in seconds. `0` keeps it until the disk is disconnected or mounted. |
 | `TIMESTAMP_FORMAT` | `%Y-%m-%d_%H-%M-%S` | strftime format used for `%TS%`. |
 | `FLAG_OWNER` | *(root)* | `user` or `user:group` that owns the flag files. |
@@ -146,9 +260,17 @@ separate settings.**
 | `FLAG_DIR_MODE` | `0775` | Mode applied to flag directories that diskwarden creates. |
 | `ON_MOUNT`, `ON_UNMOUNT`, `ON_DISCONNECT`, `ON_WARNING`, `ON_ERROR` | *(empty)* | Hook commands, described below. |
 | `HOOK_TIMEOUT` | `60` | Seconds before a hook is killed. |
+| `AUDIT_LOG` | *(empty)* | Where to find Samba audit records: empty (off), `journal`, or a file path. |
+| `AUDIT_JOURNAL_IDENTIFIER` | `smbd_audit` | Syslog identifier of the audit records when `AUDIT_LOG=journal`. |
 
-`%NAME%` (the mount's name) and `%UUID%` can be used in `MOUNT_POINT`, `*_DIR`
-and `*_NAME`. The defaults in the shipped config file differ slightly from
+`%NAME%` (the mount's name) and `%UUID%` can be used in `MOUNT_POINT`, `*_DIR`,
+`*_NAME` and `*_WORD`. `%STATUS%` can be used in `*_FLAG_NAME`.
+
+Status words make it possible to change the wording, or the language, of all
+flag names in one place. For example, `SAFE_WORD=MOZNO_ODPOJIT` with
+`SAFE_FLAG_NAME=%NAME%_%STATUS%_%TS%.txt` produces
+`backup1_MOZNO_ODPOJIT_2026-10-06_14-25-30.txt`. Words may contain any
+characters except `/ % * ? [ ]`. The defaults in the shipped config file differ slightly from
 the built-in defaults shown here; for example, it uses `/srv/diskwarden` for
 the flags.
 
@@ -168,6 +290,7 @@ shell code:
 | `DISKWARDEN_MOUNT_POINT` | mount point |
 | `DISKWARDEN_MOUNTED_FLAG` | path of the mounted flag |
 | `DISKWARDEN_MESSAGE` | human-readable description of the event |
+| `DISKWARDEN_REQUESTED_BY` | who asked for the unmount (`UNMOUNT` only; see "Who deleted the flag") |
 
 `WARNING` covers an unsupported filesystem or a missing fsck tool. `ERROR`
 covers fsck failures, mount failures and unmount failures.
